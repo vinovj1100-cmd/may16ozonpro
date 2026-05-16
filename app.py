@@ -5,7 +5,6 @@ import pytesseract
 import pypdf
 import re
 import io
-import json
 import os
 import hashlib
 from datetime import datetime
@@ -14,14 +13,6 @@ from pyzbar.pyzbar import decode
 from deep_translator import GoogleTranslator
 from fpdf import FPDF
 import logging
-
-# Attempt to import Google Sheets dependencies
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-    GSHEETS_AVAILABLE = True
-except ImportError:
-    GSHEETS_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +23,7 @@ DB_PATH = "warehouse.db"
 SCANNING_ID_REGEX = re.compile(r"\b\d{4,12}-?\d{4}-?\d?\b")
 
 # ------------------ 1. PAGE CONFIG & UI ENHANCEMENTS ------------------
-st.set_page_config(page_title="Ozon WMS Pro (Cloud)", layout="wide", page_icon="☁️", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Ozon WMS Pro", layout="wide", page_icon="🏢", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
@@ -71,7 +62,25 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS title_templates
                      (RawTitle TEXT PRIMARY KEY, StandardTitle TEXT)''')
         
-        # We no longer seed mock data automatically. The user should pull from Google Sheets.
+        # Seed Inventory if empty
+        c.execute("SELECT COUNT(*) FROM inventory")
+        if c.fetchone()[0] == 0:
+            mock_inv = [
+                ("APP-IP15-256-BLK", "APPLE IPHONE 15 256GB BLACK", 45, "A1-01"),
+                ("APP-IP15P-256-ORG", "APPLE IPHONE 15 PRO COSMIC ORANGE 256GB", 8, "A1-02"),
+                ("SAM-S24-512-GRY", "SAMSUNG GALAXY S24 TITAN GRAY 512GB", 12, "B2-15")
+            ]
+            c.executemany("INSERT INTO inventory VALUES (?, ?, ?, ?)", mock_inv)
+            
+        # Seed Orders if empty
+        c.execute("SELECT COUNT(*) FROM daily_orders")
+        if c.fetchone()[0] == 0:
+            mock_orders = [
+                ("ORD-9981", "Pending", "APP-IP15P-256-ORG, SAM-S24-512-GRY"),
+                ("ORD-9982", "Pending", "SAM-S24-512-GRY"),
+                ("ORD-9983", "Shipped", "APP-IP15-256-BLK")
+            ]
+            c.executemany("INSERT INTO daily_orders VALUES (?, ?, ?)", mock_orders)
         conn.commit()
 
 init_db()
@@ -130,60 +139,25 @@ def bulk_update_inventory(df):
 
 def bulk_update_orders(df):
     with sqlite3.connect(DB_PATH) as conn:
-        # Standardize column names back to SQL format
         df = df.rename(columns={'Order ID': 'OrderID', 'Required SKUs': 'RequiredSKUs'})
         df.to_sql('daily_orders', conn, if_exists='replace', index=False)
 
-# ------------------ 3. GOOGLE SHEETS CLOUD SYNC ENGINE ------------------
-@st.cache_resource(show_spinner="Authenticating Google Sheets...")
-def init_gsheets_client(json_credentials_str):
-    if not GSHEETS_AVAILABLE:
-        st.error("Missing libraries. Please run: pip install gspread google-auth")
-        return None
-    try:
-        creds_dict = json.loads(json_credentials_str)
-        scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        return gspread.authorize(credentials)
-    except Exception as e:
-        st.error(f"Failed to authenticate Google Sheets: {e}")
-        return None
-
-def push_to_gsheets(client, url, dataframe):
-    try:
-        sheet = client.open_by_url(url).sheet1
-        sheet.clear()
-        if not dataframe.empty:
-            sheet.update([dataframe.columns.values.tolist()] + dataframe.values.tolist())
-        return True
-    except Exception as e:
-        st.error(f"Failed to push to Google Sheets: {e}")
-        return False
-
-def pull_from_gsheets(client, url):
-    try:
-        sheet = client.open_by_url(url).sheet1
-        data = sheet.get_all_records()
-        return pd.DataFrame(data)
-    except Exception as e:
-        st.error(f"Failed to pull from Google Sheets: {e}")
-        return pd.DataFrame()
-
-# ------------------ 4. UTILITIES & PDF GENERATOR ------------------
+# ------------------ 3. UTILITIES & PDF GENERATOR ------------------
 def generate_user_guide():
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, "Ozon WMS Pro - Cloud User Guide", ln=True, align='C')
+    pdf.cell(0, 10, "Ozon WMS Pro - User Guide", ln=True, align='C')
     pdf.ln(10)
     pdf.set_font("Arial", size=12)
     instructions = [
-        ("CLOUD WARNING:", "Streamlit Cloud is ephemeral. ALWAYS push to Google Sheets when done, and pull from Sheets when starting."),
         ("Dashboard:", "View warehouse metrics, active orders, and low stock alerts."),
         ("Inbound Receiving:", "Scan new SKUs to add inventory to your master DB."),
         ("Inventory Hub:", "Live view of all warehouse stock. Edit stock directly."),
         ("Pick & Pack:", "Select an order, scan items, and deduct stock automatically."),
+        ("Returns:", "Process inbound returns and mark items damaged or restockable."),
         ("PDF Sequencer:", "Upload bulk labels and map a sequence to print sorted PDFs."),
+        ("Discrepancy Auditor:", "Paste expected vs actual IDs to spot missing items."),
         ("Bulk Convert:", "Instantly translate and standardize generic titles using saved templates.")
     ]
     for title, desc in instructions:
@@ -226,58 +200,20 @@ def standardize_title(raw_text):
 if 'session_hash' not in st.session_state:
     st.session_state.session_hash = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
 
-# ------------------ 5. SIDEBAR CONFIGURATION ------------------
+# ------------------ 4. SIDEBAR CONFIGURATION ------------------
 with st.sidebar:
     st.title("☁️ Cloud Operator")
     operator_name = st.text_input("Operator Name", value="Cloud_Staff")
     
-    st.info("⚠️ **IMPORTANT:** Always pull data when you log in, and push data before you leave.")
-    
     st.divider()
-    st.subheader("🔗 Database Sync Engine")
-    
-    # Try to load secrets from Streamlit Cloud Secrets (if configured), otherwise use text input
-    default_json = st.secrets.get("GCP_CREDENTIALS", "") if hasattr(st, "secrets") else ""
-    default_inv_url = st.secrets.get("INV_SHEET", "") if hasattr(st, "secrets") else ""
-    default_ord_url = st.secrets.get("ORD_SHEET", "") if hasattr(st, "secrets") else ""
-
-    gsheet_json = st.text_area("Service Account JSON", type="password", value=default_json)
-    inventory_sheet_url = st.text_input("Inventory Sheet URL", value=default_inv_url)
-    orders_sheet_url = st.text_input("Orders Sheet URL", value=default_ord_url)
-    
-    col_pull, col_push = st.columns(2)
-    
-    with col_pull:
-        if st.button("📥 PULL from Cloud", use_container_width=True):
-            if gsheet_json and inventory_sheet_url:
-                with st.spinner("Downloading from Sheets..."):
-                    client = init_gsheets_client(gsheet_json)
-                    if client:
-                        inv_df = pull_from_gsheets(client, inventory_sheet_url)
-                        if not inv_df.empty:
-                            bulk_update_inventory(inv_df)
-                        
-                        if orders_sheet_url:
-                            ord_df = pull_from_gsheets(client, orders_sheet_url)
-                            if not ord_df.empty:
-                                bulk_update_orders(ord_df)
-                        st.success("✅ Downloaded!")
-                        st.rerun()
-            else:
-                st.warning("Needs credentials & URL")
-
-    with col_push:
-        if st.button("📤 PUSH to Cloud", use_container_width=True, type="primary"):
-            if gsheet_json and inventory_sheet_url:
-                with st.spinner("Uploading to Sheets..."):
-                    client = init_gsheets_client(gsheet_json)
-                    if client:
-                        push_to_gsheets(client, inventory_sheet_url, get_inventory())
-                        if orders_sheet_url:
-                            push_to_gsheets(client, orders_sheet_url, get_orders())
-                        st.success("✅ Uploaded!")
-            else:
-                st.warning("Needs credentials & URL")
+    st.subheader("📚 Documentation")
+    st.download_button(
+        label="📥 Download User Guide (PDF)",
+        data=generate_user_guide(),
+        file_name="Ozon_WMS_Pro_User_Guide.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
 
     st.divider()
     st.subheader("📷 Scanner Settings")
@@ -285,7 +221,7 @@ with st.sidebar:
 
 st.title(f"🏢 Ozon WMS Pro | **{operator_name}**")
 
-# ------------------ 6. TABS LAYOUT ------------------
+# ------------------ 5. TABS LAYOUT ------------------
 tabs = st.tabs([
     "📊 Dashboard", "📥 Inbound Receiving", "📦 Inventory", "🛒 Pick & Pack", 
     "🔙 Returns", "🔍 PDF Sequencer", "⚖️ Auditor", "🔄 Bulk Convert"
@@ -306,6 +242,15 @@ with tabs[0]:
     m2.metric("⚠️ Low Stock Alerts", low_stock, delta_color="inverse")
     m3.metric("⏳ Pending Orders", pending_orders)
     m4.metric("✅ Shipped Today", shipped_orders)
+
+    st.divider()
+    st.markdown("### 📡 Quick External Tracking")
+    status_input = st.text_area("Paste External Tracking Numbers", height=100)
+    if st.button("Check API Status"):
+        tn_list = SCANNING_ID_REGEX.findall(status_input)
+        if tn_list:
+            results = [{'Tracking ID': tn, 'Status': 'In Transit', 'Location': 'Hub', 'Updated': datetime.now().strftime('%H:%M')} for tn in tn_list]
+            st.dataframe(pd.DataFrame(results), use_container_width=True)
 
 # --- TAB 2: INBOUND RECEIVING ---
 with tabs[1]:
@@ -341,14 +286,14 @@ with tabs[2]:
             st.toast("✅ Master database updated successfully!")
             st.rerun()
     else:
-        st.info("Inventory is empty. Please pull from Google Sheets or receive new stock.")
+        st.info("Inventory is empty. Please use the Inbound Receiving tab to add new stock.")
 
 # --- TAB 4: PICK & PACK ---
 with tabs[3]:
     orders_df = get_orders()
     
     if orders_df.empty:
-         st.info("No orders found. Please Pull from Cloud.")
+         st.info("No orders found in the database.")
     else:
         pending_df = orders_df[orders_df['Status'] == 'Pending']
         
