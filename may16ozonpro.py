@@ -160,7 +160,7 @@ def generate_user_guide():
         ("Discrepancy Auditor:", "Paste expected vs actual IDs to spot missing items."),
         ("Bulk Convert:", "Instantly translate and standardize generic titles using saved templates.")
     ]
-   for title, desc in instructions:
+    for title, desc in instructions:
         pdf.set_font("Arial", 'B', 12)
         pdf.cell(0, 8, title, ln=True)
         pdf.set_font("Arial", '', 11)
