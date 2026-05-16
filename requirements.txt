@@ -1,1 +1,10 @@
 streamlit
+pandas
+fpdf2
+gspread
+google-auth
+pdf2image
+pyzbar
+deep-translator
+pypdf
+pytesseract
