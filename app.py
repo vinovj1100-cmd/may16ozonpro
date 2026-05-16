@@ -166,7 +166,9 @@ def generate_user_guide():
         pdf.set_font("Arial", '', 11)
         pdf.multi_cell(0, 6, desc)
         pdf.ln(4)
-    return pdf.output()
+        
+    # Convert the bytearray to standard bytes for Streamlit
+    return bytes(pdf.output())
 
 def robust_parse_multiline(text_data):
     data_map = {}
