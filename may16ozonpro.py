@@ -351,107 +351,151 @@ with tabs[4]:
             st.error("Please scan a returning SKU.")
 
 # --- TAB 6: PDF SEQUENCER ---
-with tabs[5]:
-    st.subheader("🔍 **Pro PDF Label Sequencer**")
-    st.markdown("Upload a bulk PDF of unsorted shipping labels and paste your required sequence. The system will scan, map, and generate a new PDF sorted exactly to your specifications.")
+# --- PDF SEQUENCER ---
+elif page == "PDF Sequencer":
+    st.title("📑 Document Collator & Alphabetical Pre-Sorter")
+    st.write("Upload a bulk compound document (shipping labels/manifests). The system will automatically scan each page, extract the product name, and pre-sort the document pages alphabetically.")
     
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        sort_list = st.text_area("🎯 Target Sequence Order", height=300, placeholder="Paste Tracking IDs here (one per line)...")
-    with col2:
-        label_file = st.file_uploader("📄 Upload Labels PDF (Bulk)", type="pdf", help="Supports multi-page PDFs")
-        
-        with st.expander("⚙️ PDF Scanner Settings"):
-            scan_dpi = st.select_slider("Resolution (DPI)", options=[150, 200, 300], value=200, key="tab2_dpi", help="Higher DPI improves accuracy but slows down processing.")
-            use_ocr = st.checkbox("Enable OCR Fallback", value=True, help="Use Tesseract OCR if barcode decoding fails.")
-
-    if st.button("🚀 Scan, Sort & Generate PDF", type="primary", use_container_width=True):
-        target_ids = [tid.strip() for tid in sort_list.split('\n') if tid.strip()]
-        
-        if not target_ids:
-            st.warning("⚠️ Please provide at least one Tracking ID in the sequence order.")
-        elif not label_file:
-            st.warning("⚠️ Please upload a PDF file to process.")
-        else:
-            with st.spinner("Mapping PDF pages and re-ordering... This may take a moment."):
-                try:
-                    pdf_reader = pypdf.PdfReader(io.BytesIO(label_file.getvalue()))
+    label_pdf = st.file_uploader("Upload Bulk Shipping Manifest File", type=["pdf"])
+    
+    if label_pdf:
+        if st.button("Analyze & Pre-Sort Pages Alphabetically"):
+            try:
+                # Read PDF using pypdf
+                pdf_reader = pypdf.PdfReader(label_pdf)
+                num_pages = len(pdf_reader.pages)
+                
+                if num_pages == 0:
+                    st.error("The uploaded PDF file contains no valid structural pages.")
+                else:
+                    st.info(f"Processing {num_pages} pages. Analyzing underlying text coordinate grids...")
+                    
+                    page_mappings = []
+                    
+                    for idx, page_obj in enumerate(pdf_reader.pages):
+                        page_text = page_obj.extract_text()
+                        
+                        # Fallback heuristic: look for common labels like "Product:", "Item:", or lines matching inventory SKU naming formats
+                        product_name = "UNKNOWN_PRODUCT"
+                        
+                        # Clean up text lines for parsing
+                        lines = [line.strip() for line in page_text.split('\n') if line.strip()]
+                        
+                        for line in lines:
+                            # Heuristic 1: Explicit metadata prefix identification
+                            if any(prefix in line.upper() for prefix in ["PRODUCT:", "ITEM NAME:", "DESCRIPTION:"]):
+                                product_name = re.sub(r'(?i)^(product|item name|description):\s*', '', line).strip()
+                                break
+                            # Heuristic 2: Match lines containing known stock variants (e.g., iPhone, Galaxy)
+                            elif any(keyword in line.upper() for keyword in ["IPHONE", "GALAXY", "SAMSUNG", "APPLE"]):
+                                product_name = line.strip()
+                                break
+                        
+                        # If nothing matches, use the first non-empty line as a fallback placeholder
+                        if product_name == "UNKNOWN_PRODUCT" and lines:
+                            product_name = lines[0][:50] # constraint boundary length
+                            
+                        page_mappings.append({
+                            "page_index": idx,
+                            "product_name": product_name.upper(),
+                            "page_object": page_obj
+                        })
+                    
+                    # Sort list natively using the extracted product names alphabetically
+                    sorted_mappings = sorted(page_mappings, key=lambda x: x["product_name"])
+                    
+                    # Log summary metrics matrix back to dashboard user
+                    st.subheader("📋 Sequenced Manifest Sort Mapping Matrix")
+                    summary_data = [{"Original Page": m["page_index"] + 1, "Identified Product Key": m["product_name"]} for m in sorted_mappings]
+                    st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
+                    
+                    # Write out sorted structure to a fresh binary stream
                     pdf_writer = pypdf.PdfWriter()
-                    images = convert_from_bytes(label_file.getvalue(), dpi=scan_dpi)
+                    for item in sorted_mappings:
+                        pdf_writer.add_page(item["page_object"])
+                        
+                    output_pdf_stream = io.BytesIO()
+                    pdf_writer.write(output_pdf_stream)
+                    output_pdf_stream.seek(0)
                     
-                    id_to_page_map = {}
-                    progress_bar = st.progress(0, text="Scanning pages...")
+                    st.success("🎉 Target document compiled safely! Ready for download.")
+                    st.download_button(
+                        label="📥 Download Alphabetically Sorted Manifest (PDF)",
+                        data=output_pdf_stream.getvalue(),
+                        file_name=f"Alphabetized_Manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf"
+                    )
                     
-                    for i, img in enumerate(images):
-                        page_codes = []
-                        barcodes = decode(img)
-                        for b in barcodes:
-                            decoded_data = b.data.decode("utf-8")
-                            page_codes.extend(SCANNING_ID_REGEX.findall(decoded_data))
-                        
-                        if not barcodes and use_ocr:
-                            ocr_text = pytesseract.image_to_string(img)
-                            page_codes.extend(SCANNING_ID_REGEX.findall(ocr_text))
-                        
-                        for code in set(page_codes):
-                            id_to_page_map[code] = pdf_reader.pages[i]
-                            
-                        progress_bar.progress((i + 1) / len(images), text=f"Scanned page {i+1} of {len(images)}")
-
-                    progress_bar.empty()
-
-                    matched_count = 0
-                    for tid in target_ids:
-                        clean_tid_match = SCANNING_ID_REGEX.search(tid)
-                        search_key = clean_tid_match.group() if clean_tid_match else tid
-
-                        if search_key in id_to_page_map:
-                            pdf_writer.add_page(id_to_page_map[search_key])
-                            matched_count += 1
-
-                    st.divider()
-                    if matched_count == 0:
-                        st.error("❌ No matches found. Ensure the Tracking IDs in your list match the barcodes/text in the PDF.")
-                    else:
-                        out_io = io.BytesIO()
-                        pdf_writer.write(out_io)
-                        
-                        col_metrics1, col_metrics2, col_metrics3 = st.columns(3)
-                        col_metrics1.metric("Requested Sequence", len(target_ids))
-                        col_metrics2.metric("Successfully Mapped", matched_count)
-                        col_metrics3.metric("Missing Pages", len(target_ids) - matched_count)
-                        
-                        st.success(f"✅ Successfully created a new PDF with {matched_count} pages sorted exactly to your list!")
-                        st.download_button(
-                            label="📥 Download SORTED_LABELS.pdf", 
-                            data=out_io.getvalue(), 
-                            file_name=f"sorted_labels_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf", 
-                            mime="application/pdf",
-                            use_container_width=True
-                        )
-                        
-                        missing = [tid for tid in target_ids if (SCANNING_ID_REGEX.search(tid).group() if SCANNING_ID_REGEX.search(tid) else tid) not in id_to_page_map]
-                        if missing:
-                            st.warning(f"⚠️ **Missing from PDF ({len(missing)}):**\n" + "\n".join([f"• {m}" for m in missing]))
-                            
-                except Exception as e:
-                    st.error(f"❌ An error occurred during processing: {str(e)}")
+            except Exception as e:
+                st.error(f"Failed to sequence document buffer: {e}")
+                logger.error(f"Sequencer pipeline break: {e}", exc_info=True)
 
 # --- TAB 7: AUDITOR ---
 with tabs[6]:
+    st.subheader("⚖ Operational Discrepancy Auditor & Reconciliation Workbench")
+    st.markdown("Execute line checks across systems. Paste structural manifests to evaluate physical picking accuracy.")
+    
     col_a, col_b = st.columns(2)
-    with col_a: master_in = st.text_area("**MASTER (Expected)**", height=200)
-    with col_b: scan_in = st.text_area("**SCAN (Actual)**", height=200)
+    with col_a: 
+        master_in = st.text_area("📋 Master Manifest Records (Expected System Data)", height=220, placeholder="Paste data containing tracking entries...")
+    with col_b: 
+        scan_in = st.text_area("📦 Physical Scanner Frame Output (Actual Inbound Ingest)", height=220, placeholder="Paste or scan barcodes sequentially...")
+        
+    audit_col1, audit_col2 = st.columns(2)
+    ignore_whitespace = audit_col1.checkbox("Normalize Variations & Clear Whitespace", value=True)
+    highlight_errors_only = audit_col2.checkbox("Filter Output to Display Errors Only", value=False)
 
-    if st.button("⚡ Run Discrepancy Analysis"):
-        if master_in and scan_in:
-            m_map, s_map = robust_parse_multiline(master_in), robust_parse_multiline(scan_in)
-            results = []
-            for tid in sorted(list(set(m_map.keys()) | set(s_map.keys()))):
-                exp, got = m_map.get(tid, set()), s_map.get(tid, set())
-                status = "✅ MATCH" if exp == got else "❌ ERROR"
-                results.append({"ID": tid, "Status": status, "Expected": " | ".join(exp), "Actual": " | ".join(got)})
-            st.dataframe(pd.DataFrame(results).style.apply(lambda x: ['background-color: #ffcccc' if '❌' in str(v) else '' for v in x], axis=1), use_container_width=True)
+    if st.button("⚡ Execute High-Volume Audit Validation Check", type="primary", use_container_width=True):
+        if not master_in or not scan_in:
+            st.error("Data Deficit: Both operational telemetry zones require context vectors before checking data paths.")
+        else:
+            with st.spinner("Processing system diff tables..."):
+                m_map = robust_parse_multiline(master_in)
+                s_map = robust_parse_multiline(scan_in)
+                
+                all_tracking_ids = sorted(list(set(m_map.keys()) | set(s_map.keys())))
+                results_dataset = []
+                
+                shortages = 0
+                overages = 0
+                perfect_matches = 0
+                
+                for tid in all_tracking_ids:
+                    exp_set = m_map.get(tid, set())
+                    got_set = s_map.get(tid, set())
+                    
+                    if ignore_whitespace:
+                        exp_set = {str(item).strip().upper() for item in exp_set}
+                        got_set = {str(item).strip().upper() for item in got_set}
+                    
+                    # Structural Logic Condition Matching
+                    if not exp_set and got_set:
+                        status_flag = "⚠️ SURPLUS OVERAGE"
+                        overages += 1
+                    elif exp_set and not got_set:
+                        status_flag = "❌ CRITICAL SHORTAGE"
+                        shortages += 1
+                    elif exp_set == got_set:
+                        status_flag = "✅ STABLE MATCH"
+                        perfect_matches += 1
+                    else:
+                        status_flag = "☣ METADATA MISMATCH"
+                        shortages += 1
+                
+                    row_data = {
+                        "Tracking Reference ID": tid,
+                        "Status Class": status_flag,
+                        "Expected Elements": " | ".join(exp_set) if exp_set else "[EMPTY FIELD]",
+                        "Actual Elements": " | ".join(got_set) if got_set else "[UNREGISTERED SCAN]"
+                    }
+                    
+                    if highlight_errors_only and "MATCH" in status_flag:
+                        continue
+                    results_dataset.append(row_data)
+                
+                # Render Metrics Board
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Total Tracked Entities Checked", len(all_tracking_ids))
 
 # --- TAB 8: BULK CONVERT & TEMPLATES ---
 with tabs[7]:
