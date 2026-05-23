@@ -433,6 +433,3 @@ if results_dataset:
 st.dataframe(pd.DataFrame(results_dataset), use_container_width=True)
 else:
 st.success("No anomalies found based on configuration settings.")
-
-
-
