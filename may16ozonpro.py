@@ -249,124 +249,117 @@ with tabs[1]:
         prod_name = col1.text_input("Product Name (New items only)")
         loc_id = col2.text_input("Storage Location/Bin", value="UNASSIGNED").upper().strip()
         
-        submitted = st.form_submit_button("Register Inbound")
+        submitted = st.form_submit_form("Register Inbound")
     if submitted and sku:
-        exists = receive_inventory(sku, qty, prod_name or "Generic Product", loc_id)
-        if exists:
-            st.success(f"Updated existing SKU {sku} with +{qty} units.")
-        else:
-            st.info(f"Registered new SKU {sku} into system catalog.")
-
-# ----- TAB 3: INVENTORY HUB -----
+exists = receive_inventory(sku, qty, prod_name or "Generic Product", loc_id)
+if exists:
+st.success(f"Updated existing SKU {sku} with +{qty} units.")
+else:
+st.info(f"Registered new SKU {sku} into system catalog.")
+----- TAB 3: INVENTORY HUB -----
 with tabs[2]:
-    st.title("Master Warehouse Registry")
-    current_inv = get_inventory()
-    edited_df = st.data_editor(current_inv, num_rows="dynamic", use_container_width=True, key="inv_editor")
-    if st.button("Save Changes to Master Catalog"):
-        bulk_update_inventory(edited_df)
-        st.success("Database successfully updated.")
-        st.rerun()
-
-# ----- TAB 4: PICK & PACK -----
+st.title("Master Warehouse Registry")
+current_inv = get_inventory()
+edited_df = st.data_editor(current_inv, num_rows="dynamic", use_container_width=True, key="inv_editor")
+if st.button("Save Changes to Master Catalog"):
+bulk_update_inventory(edited_df)
+st.success("Database successfully updated.")
+st.rerun()
+----- TAB 4: PICK & PACK -----
 with tabs[3]:
-    st.title("Order Fulfillment Matrix")
-    orders = get_orders()
-    pending_orders = orders[orders['Status'] == 'Pending']
-    if pending_orders.empty:
-        st.success("All daily orders completed and dispatched!")
-    else:
-        selected_order = st.selectbox("Select Pending Order to Process", pending_orders['Order ID'])
-        order_details = pending_orders[pending_orders['Order ID'] == selected_order].iloc[0]
-        skus_to_pick = [s.strip() for s in order_details['Required SKUs'].split(',')]
-        st.markdown(f"### Items needed for order: {selected_order}")
-        inv_df = get_inventory()
-        for s in skus_to_pick:
-            match = inv_df[inv_df['SKU'] == s]
-            if not match.empty:
-                st.info(f"📌 SKU: {s} | Loc: {match.iloc[0]['Location']} | Available Stock: {match.iloc[0]['Stock']}")
-            else:
-                st.error(f"❌ SKU: {s} not found in database catalog!")
-        if st.button("Confirm Allocation & Ship Order"):
-            for s in skus_to_pick:
-                deduct_inventory(s, 1)
-            update_order_status(selected_order, "Shipped")
-            st.success(f"Order {selected_order} successfully marked as Shipped. Inventory adjusted.")
-            st.rerun()
-
-# ----- TAB 5: RETURNS -----
+st.title("Order Fulfillment Matrix")
+orders = get_orders()
+pending_orders = orders[orders['Status'] == 'Pending']
+if pending_orders.empty:
+st.success("All daily orders completed and dispatched!")
+else:
+selected_order = st.selectbox("Select Pending Order to Process", pending_orders['Order ID'])
+order_details = pending_orders[pending_orders['Order ID'] == selected_order].iloc[0]
+skus_to_pick = [s.strip() for s in order_details['Required SKUs'].split(',')]
+st.markdown(f"### Items needed for order: {selected_order}")
+for s in skus_to_pick:
+match = inv_df[inv_df['SKU'] == s]
+if not match.empty:
+st.info(f"📌 SKU: {s} | Loc: {match.iloc[0]['Location']} | Available Stock: {match.iloc[0]['Stock']}")
+else:
+st.error(f"❌ SKU: {s} not found in database catalog!")
+if st.button("Confirm Allocation & Ship Order"):
+for s in skus_to_pick:
+deduct_inventory(s, 1)
+update_order_status(selected_order, "Shipped")
+st.success(f"Order {selected_order} successfully marked as Shipped. Inventory adjusted.")
+st.rerun()
+----- TAB 5: RETURNS -----
 with tabs[4]:
-    st.title("Reverse Logistics & Returns Processing")
-    uploaded_return = st.file_uploader("Upload Return Slip or Label (Image/PDF)", type=["png", "jpg", "jpeg", "pdf"], key="return_file")
-    if uploaded_return:
-        parsed_text = ""
-        if uploaded_return.type == "application/pdf":
-            pdf_reader = pypdf.PdfReader(uploaded_return)
-            for page in pdf_reader.pages:
-                parsed_text += page.extract_text() or ""
-        else:
-            from PIL import Image
-            img = Image.open(uploaded_return)
-            parsed_text = pytesseract.image_to_string(img)
-        st.subheader("Extracted Metadata")
-        found_ids = SCANNING_ID_REGEX.findall(parsed_text)
-        if found_ids:
-            st.success(f"Detected Tracking/Order Identifier: {found_ids[0]}")
-        else:
-            st.warning("No standard Tracking ID structure matched on the document.")
-        st.text_area("Document Plain Text Dump", value=parsed_text, height=150)
-
-# ----- TAB 6: PDF SEQUENCER -----
+st.title("Reverse Logistics & Returns Processing")
+uploaded_return = st.file_uploader("Upload Return Slip or Label (Image/PDF)", type=["png", "jpg", "jpeg", "pdf"], key="return_file")
+if uploaded_return:
+parsed_text = ""
+if uploaded_return.type == "application/pdf":
+pdf_reader = pypdf.PdfReader(uploaded_return)
+for page in pdf_reader.pages:
+parsed_text += page.extract_text() or ""
+else:
+from PIL import Image
+img = Image.open(uploaded_return)
+parsed_text = pytesseract.image_to_string(img)
+st.subheader("Extracted Metadata")
+found_ids = SCANNING_ID_REGEX.findall(parsed_text)
+if found_ids:
+st.success(f"Detected Tracking/Order Identifier: {found_ids[0]}")
+else:
+st.warning("No standard Tracking ID structure matched on the document.")
+st.text_area("Document Plain Text Dump", value=parsed_text, height=150)
+----- TAB 6: PDF SEQUENCER -----
 with tabs[5]:
-    st.title("Bulk Shipping Label Sequencer")
-    labels_file = st.file_uploader("Upload Master Shipping Manifest (PDF)", type=["pdf"], key="manifest")
-    sort_order = st.text_input("Enter Desired Routing Sequence (Comma-separated sorting flags)")
-    if labels_file and st.button("Sequence & Compile Output"):
-        st.info("Sorting and parsing individual pages...")
-        # Processing workflow stub for page matching
-        st.success("PDF processed and compiled into path-optimized sorting groups.")
-
-# ----- TAB 7: DISCREPANCY AUDITOR -----
+st.title("Bulk Shipping Label Sequencer")
+labels_file = st.file_uploader("Upload Master Shipping Manifest (PDF)", type=["pdf"], key="manifest")
+sort_order = st.text_input("Enter Desired Routing Sequence (Comma-separated sorting flags)")
+if labels_file and st.button("Sequence & Compile Output"):
+st.info("Sorting and parsing individual pages...")
+# Processing workflow stub for page matching
+st.success("PDF processed and compiled into path-optimized sorting groups.")
+----- TAB 7: DISCREPANCY AUDITOR -----
 with tabs[6]:
-    st.title("Discrepancy & Variance Auditor")
-    col1, col2 = st.columns(2)
-    expected_input = col1.text_area("Expected System Manifest IDs (One per line)")
-    actual_input = col2.text_area("Actual Scanned Physical IDs (One per line)")
-    if st.button("Execute Cross-Audit"):
-        exp_set = set([line.strip() for line in expected_input.strip().split('\n') if line.strip()])
-        act_set = set([line.strip() for line in actual_input.strip().split('\n') if line.strip()])
-        missing = exp_set - act_set
-        unexpected = act_set - exp_set
-        c1, c2 = st.columns(2)
-        c1.metric("Missing Items (Shrinkage)", len(missing))
-        c2.metric("Unmanifested Excess Items", len(unexpected))
-        if missing:
-            c1.error("🚨 Missing from physical stock:")
-            c1.dataframe(list(missing), columns=["Identifier"])
-        if unexpected:
-            c2.warning("📦 Excess item mismatch:")
-            c2.dataframe(list(unexpected), columns=["Identifier"])
-
-# ----- TAB 8: BULK CONVERT (TRANSLATE & STANDARDIZE) -----
+st.title("Discrepancy & Variance Auditor")
+col1, col2 = st.columns(2)
+expected_input = col1.text_area("Expected System Manifest IDs (One per line)")
+actual_input = col2.text_area("Actual Scanned Physical IDs (One per line)")
+if st.button("Execute Cross-Audit"):
+exp_set = set([line.strip() for line in expected_input.strip().split('\n') if line.strip()])
+act_set = set([line.strip() for line in actual_input.strip().split('\n') if line.strip()])
+missing = exp_set - act_set
+unexpected = act_set - exp_set
+c1, c2 = st.columns(2)
+c1.metric("Missing Items (Shrinkage)", len(missing))
+c2.metric("Unmanifested Excess Items", len(unexpected))
+if missing:
+c1.error("🚨 Missing from physical stock:")
+c1.dataframe(list(missing), columns=["Identifier"])
+if unexpected:
+c2.warning("📦 Excess item mismatch:")
+c2.dataframe(list(unexpected), columns=["Identifier"])
+----- TAB 8: BULK CONVERT (TRANSLATE & STANDARDIZE) -----
 with tabs[7]:
-    st.title("Global Title Normalization Tool")
-    raw_title_input = st.text_area("Enter Raw Russian/External Marketplace Titles (One per line)")
-    if st.button("Translate & Normalize Batch"):
-        if raw_title_input.strip():
-            lines = [line.strip() for line in raw_title_input.strip().split('\n') if line.strip()]
-            results = []
-            # Load current saved template cache
-            templates_df = get_templates()
-            cache = dict(zip(templates_df['RawTitle'], templates_df['StandardTitle']))
-            for line in lines:
-                if line in cache:
-                    results.append({"Raw Input": line, "Normalized Master Title": cache[line], "Source": "Local Cache Rules"})
-                else:
-                    try:
-                        translated = GoogleTranslator(source='auto', target='en').translate(line)
-                        standardized = standardize_title(translated)
-                        upsert_template(line, standardized)
-                        results.append({"Raw Input": line, "Normalized Master Title": standardized, "Source": "Deep Translation Engine"})
-                    except Exception as e:
-                        results.append({"Raw Input": line, "Normalized Master Title": "Translation Mismatch Error", "Source": "Error"})
-            st.dataframe(pd.DataFrame(results), use_container_width=True)
-            st.success("Batch transformation complete. Variations cached to template database.")
+st.title("Global Title Normalization Tool")
+raw_title_input = st.text_area("Enter Raw Russian/External Marketplace Titles (One per line)")
+if st.button("Translate & Normalize Batch"):
+if raw_title_input.strip():
+lines = [line.strip() for line in raw_title_input.strip().split('\n') if line.strip()]
+results = []
+# Load current saved template cache
+templates_df = get_templates()
+cache = dict(zip(templates_df['RawTitle'], templates_df['StandardTitle']))
+for line in lines:
+if line in cache:
+results.append({"Raw Input": line, "Normalized Master Title": cache[line], "Source": "Local Cache Rules"})
+else:
+try:
+translated = GoogleTranslator(source='auto', target='en').translate(line)
+standardized = standardize_title(translated)
+upsert_template(line, standardized)
+results.append({"Raw Input": line, "Normalized Master Title": standardized, "Source": "Deep Translation Engine"})
+except Exception as e:
+results.append({"Raw Input": line, "Normalized Master Title": "Translation Mismatch Error", "Source": "Error"})
+st.dataframe(pd.DataFrame(results), use_container_width=True)
+st.success("Batch transformation complete. Variations cached to template database.")
