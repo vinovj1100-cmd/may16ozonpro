@@ -357,8 +357,17 @@ with tabs[5]:
     
     label_pdf = st.file_uploader("Upload Bulk Shipping Manifest File", type=["pdf"])
     
+    st.divider()
+    st.markdown("### 🔗 **Custom Sort by Reference Tracking Numbers (Optional)**")
+    st.write("Paste a comma-separated or line-separated list of tracking numbers to sort the PDF pages in a specific order. Leave blank to sort alphabetically by product name.")
+    reference_tracking = st.text_area(
+        "📌 Reference Tracking Numbers",
+        height=100,
+        placeholder="Enter tracking numbers (e.g., 1234-5678, 9999-0001, 8765-4321) or one per line"
+    )
+    
     if label_pdf:
-        if st.button("Analyze & Pre-Sort Pages Alphabetically"):
+        if st.button("Analyze & Pre-Sort Pages"):
             try:
                 # Read PDF using pypdf
                 pdf_reader = pypdf.PdfReader(label_pdf)
@@ -376,11 +385,17 @@ with tabs[5]:
                         
                         # Fallback heuristic: look for common labels like "Product:", "Item:", or lines matching inventory SKU naming formats
                         product_name = "UNKNOWN_PRODUCT"
+                        tracking_number = None
                         
                         # Clean up text lines for parsing
                         lines = [line.strip() for line in page_text.split('\n') if line.strip()]
                         
                         for line in lines:
+                            # Extract tracking number from page
+                            tn_match = SCANNING_ID_REGEX.search(line)
+                            if tn_match and not tracking_number:
+                                tracking_number = tn_match.group()
+                            
                             # Heuristic 1: Explicit metadata prefix identification
                             if any(prefix in line.upper() for prefix in ["PRODUCT:", "ITEM NAME:", "DESCRIPTION:"]):
                                 product_name = re.sub(r'(?i)^(product|item name|description):\s*', '', line).strip()
@@ -397,15 +412,47 @@ with tabs[5]:
                         page_mappings.append({
                             "page_index": idx,
                             "product_name": product_name.upper(),
+                            "tracking_number": tracking_number,
                             "page_object": page_obj
                         })
                     
-                    # Sort list natively using the extracted product names alphabetically
-                    sorted_mappings = sorted(page_mappings, key=lambda x: x["product_name"])
+                    # Parse reference tracking numbers and create sort order
+                    reference_order = []
+                    if reference_tracking.strip():
+                        # Handle both comma-separated and line-separated formats
+                        if ',' in reference_tracking:
+                            reference_order = [tn.strip() for tn in reference_tracking.split(',') if tn.strip()]
+                        else:
+                            reference_order = [tn.strip() for tn in reference_tracking.split('\n') if tn.strip()]
+                    
+                    # Sort pages based on reference order or alphabetically
+                    if reference_order:
+                        # Create a priority mapping for reference tracking numbers
+                        priority_map = {tn: idx for idx, tn in enumerate(reference_order)}
+                        
+                        sorted_mappings = sorted(
+                            page_mappings, 
+                            key=lambda x: (
+                                priority_map.get(x["tracking_number"], len(reference_order)),
+                                x["product_name"]
+                            )
+                        )
+                        st.success(f"✅ Sorted by {len(reference_order)} reference tracking numbers!")
+                    else:
+                        # Sort alphabetically by product name
+                        sorted_mappings = sorted(page_mappings, key=lambda x: x["product_name"])
+                        st.success("✅ Sorted alphabetically by product name!")
                     
                     # Log summary metrics matrix back to dashboard user
                     st.subheader("📋 Sequenced Manifest Sort Mapping Matrix")
-                    summary_data = [{"Original Page": m["page_index"] + 1, "Identified Product Key": m["product_name"]} for m in sorted_mappings]
+                    summary_data = [
+                        {
+                            "Original Page": m["page_index"] + 1, 
+                            "Identified Product Key": m["product_name"],
+                            "Tracking Number": m["tracking_number"] if m["tracking_number"] else "N/A"
+                        } 
+                        for m in sorted_mappings
+                    ]
                     st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
                     
                     # Write out sorted structure to a fresh binary stream
@@ -419,9 +466,9 @@ with tabs[5]:
                     
                     st.success("🎉 Target document compiled safely! Ready for download.")
                     st.download_button(
-                        label="📥 Download Alphabetically Sorted Manifest (PDF)",
+                        label="📥 Download Sorted Manifest (PDF)",
                         data=output_pdf_stream.getvalue(),
-                        file_name=f"Alphabetized_Manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        file_name=f"Sorted_Manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
                         mime="application/pdf"
                     )
                     
