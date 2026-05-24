@@ -13,6 +13,8 @@ from pyzbar.pyzbar import decode
 from deep_translator import GoogleTranslator
 from fpdf import FPDF
 import logging
+from PIL import Image
+import numpy as np
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -199,6 +201,48 @@ def standardize_title(raw_text):
             text = text.replace(key, value)
     return text.strip()
 
+def extract_text_from_image(image):
+    """Extract text from image using OCR (Tesseract)"""
+    try:
+        img_array = np.array(image)
+        text = pytesseract.image_to_string(img_array)
+        return text
+    except Exception as e:
+        logger.error(f"OCR extraction failed: {e}")
+        return ""
+
+def parse_receiving_data(text_data):
+    """Parse receiving data from OCR or manual input"""
+    receiving_items = []
+    lines = text_data.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Try to extract SKU and quantity pattern
+        # Expected format: SKU | DESCRIPTION | QTY or similar
+        parts = [p.strip() for p in line.split('|')]
+        
+        if len(parts) >= 2:
+            sku = parts[0]
+            # Try to find quantity (look for numbers at the end)
+            qty_match = re.search(r'(\d+)\s*$', line)
+            qty = int(qty_match.group(1)) if qty_match else 1
+            
+            description = parts[1] if len(parts) > 1 else "From Photo/Sheet"
+            location = parts[2] if len(parts) > 2 else "UNASSIGNED"
+            
+            receiving_items.append({
+                'sku': sku,
+                'product': description,
+                'quantity': qty,
+                'location': location
+            })
+    
+    return receiving_items
+
 if 'session_hash' not in st.session_state:
     st.session_state.session_hash = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
 
@@ -256,21 +300,183 @@ with tabs[0]:
 
 # --- TAB 2: INBOUND RECEIVING ---
 with tabs[1]:
-    col_in1, col_in2, col_in3 = st.columns(3)
-    with col_in1: inbound_sku = st.text_input("Scan / Enter SKU")
-    with col_in2: inbound_qty = st.number_input("Quantity Received", min_value=1, value=1)
-    with col_in3: inbound_bin = st.text_input("Assign to Bin Location", placeholder="e.g., C4-10")
-    inbound_desc = st.text_input("Product Description (If New SKU)")
+    st.markdown("## 📥 **Inbound Receiving Hub**")
+    st.write("Choose your preferred method to add inventory: Manual scanning, Google Sheet photos, or Excel files.")
+    
+    receiving_method = st.radio("Select Receiving Method", ["Manual Scan", "📸 Photo Upload (Google Sheets)", "📊 Excel File Upload"], horizontal=True)
+    
+    st.divider()
+    
+    if receiving_method == "Manual Scan":
+        st.markdown("### Manual Item Entry")
+        col_in1, col_in2, col_in3 = st.columns(3)
+        with col_in1: 
+            inbound_sku = st.text_input("Scan / Enter SKU")
+        with col_in2: 
+            inbound_qty = st.number_input("Quantity Received", min_value=1, value=1)
+        with col_in3: 
+            inbound_bin = st.text_input("Assign to Bin Location", placeholder="e.g., C4-10")
+        inbound_desc = st.text_input("Product Description (If New SKU)")
 
-    if st.button("➕ Receive Inventory", type="primary"):
-        if inbound_sku:
-            is_update = receive_inventory(inbound_sku, inbound_qty, inbound_desc, inbound_bin)
-            if is_update:
-                st.toast(f"Updated {inbound_sku}: +{inbound_qty} units", icon="📦")
+        if st.button("➕ Receive Inventory", type="primary"):
+            if inbound_sku:
+                is_update = receive_inventory(inbound_sku, inbound_qty, inbound_desc, inbound_bin)
+                if is_update:
+                    st.toast(f"Updated {inbound_sku}: +{inbound_qty} units", icon="📦")
+                else:
+                    st.toast(f"Created new SKU: {inbound_sku}", icon="✨")
             else:
-                st.toast(f"Created new SKU: {inbound_sku}", icon="✨")
-        else:
-            st.error("Please enter a SKU.")
+                st.error("Please enter a SKU.")
+    
+    elif receiving_method == "📸 Photo Upload (Google Sheets)":
+        st.markdown("### Upload Google Sheet Screenshots")
+        st.write("Upload a photo of your Google Sheet inventory list. The system will use OCR to extract SKUs, quantities, and product descriptions.")
+        
+        photo_upload = st.file_uploader("📸 Upload Sheet Photo (JPG/PNG)", type=["jpg", "jpeg", "png"])
+        
+        if photo_upload:
+            image = Image.open(photo_upload)
+            
+            col_img, col_preview = st.columns([1, 1])
+            with col_img:
+                st.image(image, caption="Uploaded Photo", use_container_width=True)
+            
+            with col_preview:
+                st.markdown("**Photo Preview**")
+                if st.button("🔍 Extract Text via OCR", type="primary"):
+                    with st.spinner("Extracting text from photo..."):
+                        extracted_text = extract_text_from_image(image)
+                        st.session_state.photo_text = extracted_text
+                        st.success("✅ Text extracted successfully!")
+            
+            if 'photo_text' in st.session_state and st.session_state.photo_text:
+                st.markdown("**Extracted Text**")
+                extracted_display = st.text_area(
+                    "Extracted Data (Edit if needed)",
+                    value=st.session_state.photo_text,
+                    height=200,
+                    key="photo_extracted"
+                )
+                
+                col_parse, col_clear = st.columns([3, 1])
+                with col_parse:
+                    if st.button("✨ Parse & Preview Items", type="primary"):
+                        parsed_items = parse_receiving_data(extracted_display)
+                        if parsed_items:
+                            st.session_state.parsed_items = parsed_items
+                            st.success(f"✅ Parsed {len(parsed_items)} items!")
+                        else:
+                            st.warning("⚠️ Could not parse items. Check the format and try again.")
+                
+                with col_clear:
+                    if st.button("🔄 Clear", use_container_width=True):
+                        st.session_state.pop('photo_text', None)
+                        st.session_state.pop('parsed_items', None)
+                        st.rerun()
+            
+            if 'parsed_items' in st.session_state:
+                st.markdown("### 📋 Preview Items to Receive")
+                items_df = pd.DataFrame(st.session_state.parsed_items)
+                
+                edited_items = st.data_editor(
+                    items_df,
+                    use_container_width=True,
+                    column_config={
+                        "quantity": st.column_config.NumberColumn("quantity", min_value=1)
+                    }
+                )
+                
+                if st.button("✅ Receive All Items from Photo", type="primary", use_container_width=True):
+                    success_count = 0
+                    for _, row in edited_items.iterrows():
+                        receive_inventory(
+                            row['sku'],
+                            int(row['quantity']),
+                            row['product'],
+                            row['location']
+                        )
+                        success_count += 1
+                    
+                    st.toast(f"✅ Successfully received {success_count} items from photo!", icon="📦")
+                    st.session_state.pop('parsed_items', None)
+                    st.rerun()
+    
+    elif receiving_method == "📊 Excel File Upload":
+        st.markdown("### Upload Excel Inventory File")
+        st.write("Upload an Excel file with columns: SKU, Product Description, Quantity, Location (optional)")
+        
+        excel_upload = st.file_uploader("📊 Upload Excel File", type=["xlsx", "xls", "csv"])
+        
+        if excel_upload:
+            try:
+                if excel_upload.name.endswith('.csv'):
+                    excel_df = pd.read_csv(excel_upload)
+                else:
+                    excel_df = pd.read_excel(excel_upload)
+                
+                st.markdown("### 📋 Preview Excel Data")
+                st.dataframe(excel_df, use_container_width=True)
+                
+                # Column mapping
+                st.markdown("### 🔗 Column Mapping")
+                col_map_col1, col_map_col2, col_map_col3, col_map_col4 = st.columns(4)
+                
+                available_cols = excel_df.columns.tolist()
+                
+                with col_map_col1:
+                    sku_col = st.selectbox("Select SKU Column", available_cols, key="sku_col")
+                with col_map_col2:
+                    product_col = st.selectbox("Select Product Column", available_cols, key="product_col")
+                with col_map_col3:
+                    qty_col = st.selectbox("Select Quantity Column", available_cols, key="qty_col")
+                with col_map_col4:
+                    location_col = st.selectbox("Select Location Column (Optional)", [None] + available_cols, key="location_col")
+                
+                # Preview mapped data
+                st.markdown("### ✅ Mapped Preview")
+                mapped_preview = []
+                for _, row in excel_df.iterrows():
+                    mapped_preview.append({
+                        'sku': str(row[sku_col]).strip(),
+                        'product': str(row[product_col]).strip(),
+                        'quantity': int(row[qty_col]) if pd.notna(row[qty_col]) else 1,
+                        'location': str(row[location_col]).strip() if location_col and pd.notna(row[location_col]) else 'UNASSIGNED'
+                    })
+                
+                preview_df = pd.DataFrame(mapped_preview)
+                st.dataframe(preview_df, use_container_width=True)
+                
+                # Submit button
+                if st.button("✅ Receive All Items from Excel", type="primary", use_container_width=True):
+                    success_count = 0
+                    error_count = 0
+                    
+                    with st.spinner("Processing Excel file..."):
+                        for item in mapped_preview:
+                            try:
+                                receive_inventory(
+                                    item['sku'],
+                                    item['quantity'],
+                                    item['product'],
+                                    item['location']
+                                )
+                                success_count += 1
+                            except Exception as e:
+                                logger.error(f"Error receiving {item['sku']}: {e}")
+                                error_count += 1
+                    
+                    col_result1, col_result2 = st.columns(2)
+                    with col_result1:
+                        st.success(f"✅ Successfully received {success_count} items!")
+                    if error_count > 0:
+                        with col_result2:
+                            st.warning(f"⚠️ Failed to process {error_count} items")
+                    
+                    st.balloons()
+                    
+            except Exception as e:
+                st.error(f"❌ Error processing Excel file: {e}")
+                logger.error(f"Excel processing error: {e}", exc_info=True)
 
 # --- TAB 3: INVENTORY HUB ---
 with tabs[2]:
