@@ -351,8 +351,7 @@ with tabs[4]:
             st.error("Please scan a returning SKU.")
 
 # --- TAB 6: PDF SEQUENCER ---
-# --- PDF SEQUENCER ---
-elif page == "PDF Sequencer":
+with tabs[5]:
     st.title("📑 Document Collator & Alphabetical Pre-Sorter")
     st.write("Upload a bulk compound document (shipping labels/manifests). The system will automatically scan each page, extract the product name, and pre-sort the document pages alphabetically.")
     
@@ -393,7 +392,7 @@ elif page == "PDF Sequencer":
                         
                         # If nothing matches, use the first non-empty line as a fallback placeholder
                         if product_name == "UNKNOWN_PRODUCT" and lines:
-                            product_name = lines[0][:50] # constraint boundary length
+                            product_name = lines[0][:50]
                             
                         page_mappings.append({
                             "page_index": idx,
@@ -496,6 +495,12 @@ with tabs[6]:
                 # Render Metrics Board
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Total Tracked Entities Checked", len(all_tracking_ids))
+                m2.metric("Perfect Matches", perfect_matches)
+                m3.metric("Shortages Found", shortages)
+                m4.metric("Overages Found", overages)
+                
+                # Display results
+                st.dataframe(pd.DataFrame(results_dataset), use_container_width=True)
 
 # --- TAB 8: BULK CONVERT & TEMPLATES ---
 with tabs[7]:
