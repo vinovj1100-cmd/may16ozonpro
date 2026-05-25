@@ -8,3 +8,5 @@ pyzbar
 deep-translator
 pypdf
 pytesseract
+gunicorn==23.0.0
+
