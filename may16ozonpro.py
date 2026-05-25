@@ -8,13 +8,11 @@ import io
 import os
 import hashlib
 from datetime import datetime
-from pdf2image import convert_from_bytes
-from pyzbar.pyzbar import decode
-from deep_translator import GoogleTranslator
-from fpdf import FPDF
 import logging
 from PIL import Image
 import numpy as np
+from deep_translator import GoogleTranslator
+from fpdf import FPDF
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +50,14 @@ st.markdown("""
     h1, h2, h3 { color: #f8f8f2; }
 </style>
 """, unsafe_allow_html=True)
+
+# Initialize functional session states safely
+if 'session_hash' not in st.session_state:
+    st.session_state.session_hash = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+if 'photo_text' not in st.session_state:
+    st.session_state.photo_text = ""
+if 'parsed_items' not in st.session_state:
+    st.session_state.parsed_items = None
 
 # ------------------ 2. SQLITE DATABASE ENGINE ------------------
 def init_db():
@@ -108,14 +114,13 @@ def upsert_template(raw, standard):
 def receive_inventory(sku, qty, product="Unknown Product", location="UNASSIGNED"):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("SELECT Stock FROM inventory WHERE SKU = ?", (sku,))
+        c.execute("SELECT Stock, Product, Location FROM inventory WHERE SKU = ?", (sku,))
         row = c.fetchone()
         if row:
             new_stock = row[0] + qty
-            if location != "UNASSIGNED":
-                c.execute("UPDATE inventory SET Stock = ?, Location = ? WHERE SKU = ?", (new_stock, location, sku))
-            else:
-                c.execute("UPDATE inventory SET Stock = ? WHERE SKU = ?", (new_stock, sku))
+            final_loc = location if location != "UNASSIGNED" else row[2]
+            final_prod = product if product != "Unknown Product" else row[1]
+            c.execute("UPDATE inventory SET Stock = ?, Product = ?, Location = ? WHERE SKU = ?", (new_stock, final_prod, final_loc, sku))
             conn.commit()
             return True 
         else:
@@ -137,12 +142,13 @@ def update_order_status(order_id, status):
 
 def bulk_update_inventory(df):
     with sqlite3.connect(DB_PATH) as conn:
-        df.to_sql('inventory', conn, if_exists='replace', index=False)
-
-def bulk_update_orders(df):
-    with sqlite3.connect(DB_PATH) as conn:
-        df = df.rename(columns={'Order ID': 'OrderID', 'Required SKUs': 'RequiredSKUs'})
-        df.to_sql('daily_orders', conn, if_exists='replace', index=False)
+        c = conn.cursor()
+        # Safe bulk transaction rewrite preserving structural configurations
+        c.execute("DELETE FROM inventory")
+        for _, row in df.iterrows():
+            c.execute("INSERT INTO inventory (SKU, Product, Stock, Location) VALUES (?, ?, ?, ?)", 
+                      (str(row['SKU']), str(row['Product']), int(row['Stock']), str(row['Location'])))
+        conn.commit()
 
 # ------------------ 3. UTILITIES & PDF GENERATOR ------------------
 def generate_user_guide():
@@ -151,7 +157,7 @@ def generate_user_guide():
     pdf.set_font("Arial", 'B', 16)
     pdf.cell(0, 10, "Ozon WMS Pro - User Guide", ln=True, align='C')
     pdf.ln(10)
-    pdf.set_font("Arial", size=12)
+    
     instructions = [
         ("Dashboard:", "View warehouse metrics, active orders, and low stock alerts."),
         ("Inbound Receiving:", "Scan new SKUs to add inventory to your master DB."),
@@ -169,8 +175,8 @@ def generate_user_guide():
         pdf.multi_cell(0, 6, desc)
         pdf.ln(4)
         
-    # Convert the bytearray to standard bytes for Streamlit
-    return bytes(pdf.output())
+    # Standard string output cast as bytes buffer object
+    return pdf.output(dest='S').encode('latin1')
 
 def robust_parse_multiline(text_data):
     data_map = {}
@@ -189,6 +195,7 @@ def robust_parse_multiline(text_data):
     return data_map
 
 def standardize_title(raw_text):
+    if not raw_text: return "UNKNOWN"
     text = raw_text.upper().replace("SMARTPHONE ", "").replace("MOBILE PHONE ", "")
     mappings = {
         "IPHONE": "APPLE IPHONE", " ORANGE": " COSMIC ORANGE", 
@@ -202,7 +209,6 @@ def standardize_title(raw_text):
     return text.strip()
 
 def extract_text_from_image(image):
-    """Extract text from image using OCR (Tesseract)"""
     try:
         img_array = np.array(image)
         text = pytesseract.image_to_string(img_array)
@@ -212,39 +218,38 @@ def extract_text_from_image(image):
         return ""
 
 def parse_receiving_data(text_data):
-    """Parse receiving data from OCR or manual input"""
     receiving_items = []
     lines = text_data.strip().split('\n')
     
     for line in lines:
         line = line.strip()
-        if not line:
-            continue
+        if not line: continue
         
-        # Try to extract SKU and quantity pattern
-        # Expected format: SKU | DESCRIPTION | QTY or similar
-        parts = [p.strip() for p in line.split('|')]
-        
-        if len(parts) >= 2:
+        # Check if line contains layout pipes
+        if '|' in line:
+            parts = [p.strip() for p in line.split('|')]
             sku = parts[0]
-            # Try to find quantity (look for numbers at the end)
+            description = parts[1] if len(parts) > 1 else "From Photo/Sheet"
             qty_match = re.search(r'(\d+)\s*$', line)
             qty = int(qty_match.group(1)) if qty_match else 1
-            
-            description = parts[1] if len(parts) > 1 else "From Photo/Sheet"
             location = parts[2] if len(parts) > 2 else "UNASSIGNED"
+        else:
+            # Fallback regex spacing analyzer if strings aren't structured with pipes
+            tokens = line.split()
+            if not tokens: continue
+            sku = tokens[0]
+            qty_match = re.search(r'\b(\d+)\b', line)
+            qty = int(qty_match.group(1)) if qty_match else 1
+            description = "OCR Text Line Extraction Match"
+            location = "UNASSIGNED"
             
-            receiving_items.append({
-                'sku': sku,
-                'product': description,
-                'quantity': qty,
-                'location': location
-            })
-    
+        receiving_items.append({
+            'sku': sku,
+            'product': description,
+            'quantity': qty,
+            'location': location
+        })
     return receiving_items
-
-if 'session_hash' not in st.session_state:
-    st.session_state.session_hash = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
 
 # ------------------ 4. SIDEBAR CONFIGURATION ------------------
 with st.sidebar:
@@ -260,10 +265,6 @@ with st.sidebar:
         mime="application/pdf",
         use_container_width=True
     )
-
-    st.divider()
-    st.subheader("📷 Scanner Settings")
-    scan_dpi = st.select_slider("PDF DPI Resolution", options=[150, 200, 300], value=200)
 
 st.title(f"🏢 Ozon WMS Pro | **{operator_name}**")
 
@@ -301,139 +302,66 @@ with tabs[0]:
 # --- TAB 2: INBOUND RECEIVING ---
 with tabs[1]:
     st.markdown("## 📥 **Inbound Receiving Hub**")
-    st.write("Choose your preferred method to add inventory: Manual scanning, Google Sheet photos, or Excel files.")
-    
     receiving_method = st.radio("Select Receiving Method", ["Manual Scan", "📸 Photo Upload (Google Sheets)", "📊 Excel File Upload"], horizontal=True)
-    
     st.divider()
     
     if receiving_method == "Manual Scan":
-        st.markdown("### Manual Item Entry")
         col_in1, col_in2, col_in3 = st.columns(3)
-        with col_in1: 
-            inbound_sku = st.text_input("Scan / Enter SKU")
-        with col_in2: 
-            inbound_qty = st.number_input("Quantity Received", min_value=1, value=1)
-        with col_in3: 
-            inbound_bin = st.text_input("Assign to Bin Location", placeholder="e.g., C4-10")
+        with col_in1: inbound_sku = st.text_input("Scan / Enter SKU")
+        with col_in2: inbound_qty = st.number_input("Quantity Received", min_value=1, value=1)
+        with col_in3: inbound_bin = st.text_input("Assign to Bin Location", placeholder="e.g., C4-10")
         inbound_desc = st.text_input("Product Description (If New SKU)")
 
         if st.button("➕ Receive Inventory", type="primary"):
             if inbound_sku:
-                is_update = receive_inventory(inbound_sku, inbound_qty, inbound_desc, inbound_bin)
-                if is_update:
-                    st.toast(f"Updated {inbound_sku}: +{inbound_qty} units", icon="📦")
-                else:
-                    st.toast(f"Created new SKU: {inbound_sku}", icon="✨")
+                is_update = receive_inventory(inbound_sku, inbound_qty, inbound_desc or "Unknown Product", inbound_bin or "UNASSIGNED")
+                if is_update: st.toast(f"Updated {inbound_sku}: +{inbound_qty} units", icon="📦")
+                else: st.toast(f"Created new SKU: {inbound_sku}", icon="✨")
+                st.rerun()
             else:
                 st.error("Please enter a SKU.")
-    
+                
     elif receiving_method == "📸 Photo Upload (Google Sheets)":
-        st.markdown("### Upload Google Sheet Screenshots")
-        st.write("Upload a photo of your Google Sheet inventory list. The system will use OCR to extract SKUs, quantities, and product descriptions.")
-        
         photo_upload = st.file_uploader("📸 Upload Sheet Photo (JPG/PNG)", type=["jpg", "jpeg", "png"])
-        
         if photo_upload:
             image = Image.open(photo_upload)
-            
             col_img, col_preview = st.columns([1, 1])
-            with col_img:
-                st.image(image, caption="Uploaded Photo", use_container_width=True)
-            
+            with col_img: st.image(image, caption="Uploaded Photo", use_container_width=True)
             with col_preview:
-                st.markdown("**Photo Preview**")
                 if st.button("🔍 Extract Text via OCR", type="primary"):
-                    with st.spinner("Extracting text from photo..."):
-                        extracted_text = extract_text_from_image(image)
-                        st.session_state.photo_text = extracted_text
+                    with st.spinner("Extracting text..."):
+                        st.session_state.photo_text = extract_text_from_image(image)
                         st.success("✅ Text extracted successfully!")
             
-            if 'photo_text' in st.session_state and st.session_state.photo_text:
-                st.markdown("**Extracted Text**")
-                extracted_display = st.text_area(
-                    "Extracted Data (Edit if needed)",
-                    value=st.session_state.photo_text,
-                    height=200,
-                    key="photo_extracted"
-                )
-                
-                col_parse, col_clear = st.columns([3, 1])
-                with col_parse:
-                    if st.button("✨ Parse & Preview Items", type="primary"):
-                        parsed_items = parse_receiving_data(extracted_display)
-                        if parsed_items:
-                            st.session_state.parsed_items = parsed_items
-                            st.success(f"✅ Parsed {len(parsed_items)} items!")
-                        else:
-                            st.warning("⚠️ Could not parse items. Check the format and try again.")
-                
-                with col_clear:
-                    if st.button("🔄 Clear", use_container_width=True):
-                        st.session_state.pop('photo_text', None)
-                        st.session_state.pop('parsed_items', None)
-                        st.rerun()
+            if st.session_state.photo_text:
+                extracted_display = st.text_area("Extracted Data (Edit if needed)", value=st.session_state.photo_text, height=200)
+                if st.button("✨ Parse & Preview Items", type="primary"):
+                    st.session_state.parsed_items = parse_receiving_data(extracted_display)
             
-            if 'parsed_items' in st.session_state:
-                st.markdown("### 📋 Preview Items to Receive")
+            if st.session_state.parsed_items:
                 items_df = pd.DataFrame(st.session_state.parsed_items)
-                
-                edited_items = st.data_editor(
-                    items_df,
-                    use_container_width=True,
-                    column_config={
-                        "quantity": st.column_config.NumberColumn("quantity", min_value=1)
-                    }
-                )
-                
-                if st.button("✅ Receive All Items from Photo", type="primary", use_container_width=True):
-                    success_count = 0
+                edited_items = st.data_editor(items_df, use_container_width=True)
+                if st.button("✅ Receive All Items from Photo", type="primary"):
                     for _, row in edited_items.iterrows():
-                        receive_inventory(
-                            row['sku'],
-                            int(row['quantity']),
-                            row['product'],
-                            row['location']
-                        )
-                        success_count += 1
-                    
-                    st.toast(f"✅ Successfully received {success_count} items from photo!", icon="📦")
-                    st.session_state.pop('parsed_items', None)
+                        receive_inventory(row['sku'], int(row['quantity']), row['product'], row['location'])
+                    st.toast("✅ Successfully integrated entries!", icon="📦")
+                    st.session_state.parsed_items = None
                     st.rerun()
-    
+
     elif receiving_method == "📊 Excel File Upload":
-        st.markdown("### Upload Excel Inventory File")
-        st.write("Upload an Excel file with columns: SKU, Product Description, Quantity, Location (optional)")
-        
         excel_upload = st.file_uploader("📊 Upload Excel File", type=["xlsx", "xls", "csv"])
-        
         if excel_upload:
             try:
-                if excel_upload.name.endswith('.csv'):
-                    excel_df = pd.read_csv(excel_upload)
-                else:
-                    excel_df = pd.read_excel(excel_upload)
-                
-                st.markdown("### 📋 Preview Excel Data")
+                excel_df = pd.read_csv(excel_upload) if excel_upload.name.endswith('.csv') else pd.read_excel(excel_upload)
                 st.dataframe(excel_df, use_container_width=True)
-                
-                # Column mapping
-                st.markdown("### 🔗 Column Mapping")
-                col_map_col1, col_map_col2, col_map_col3, col_map_col4 = st.columns(4)
-                
                 available_cols = excel_df.columns.tolist()
                 
-                with col_map_col1:
-                    sku_col = st.selectbox("Select SKU Column", available_cols, key="sku_col")
-                with col_map_col2:
-                    product_col = st.selectbox("Select Product Column", available_cols, key="product_col")
-                with col_map_col3:
-                    qty_col = st.selectbox("Select Quantity Column", available_cols, key="qty_col")
-                with col_map_col4:
-                    location_col = st.selectbox("Select Location Column (Optional)", [None] + available_cols, key="location_col")
+                col_map_col1, col_map_col2, col_map_col3, col_map_col4 = st.columns(4)
+                with col_map_col1: sku_col = st.selectbox("SKU Column", available_cols)
+                with col_map_col2: product_col = st.selectbox("Product Column", available_cols)
+                with col_map_col3: qty_col = st.selectbox("Quantity Column", available_cols)
+                with col_map_col4: location_col = st.selectbox("Location Column (Optional)", [None] + available_cols)
                 
-                # Preview mapped data
-                st.markdown("### ✅ Mapped Preview")
                 mapped_preview = []
                 for _, row in excel_df.iterrows():
                     mapped_preview.append({
@@ -443,197 +371,135 @@ with tabs[1]:
                         'location': str(row[location_col]).strip() if location_col and pd.notna(row[location_col]) else 'UNASSIGNED'
                     })
                 
-                preview_df = pd.DataFrame(mapped_preview)
-                st.dataframe(preview_df, use_container_width=True)
-                
-                # Submit button
-                if st.button("✅ Receive All Items from Excel", type="primary", use_container_width=True):
-                    success_count = 0
-                    error_count = 0
-                    
-                    with st.spinner("Processing Excel file..."):
-                        for item in mapped_preview:
-                            try:
-                                receive_inventory(
-                                    item['sku'],
-                                    item['quantity'],
-                                    item['product'],
-                                    item['location']
-                                )
-                                success_count += 1
-                            except Exception as e:
-                                logger.error(f"Error receiving {item['sku']}: {e}")
-                                error_count += 1
-                    
-                    col_result1, col_result2 = st.columns(2)
-                    with col_result1:
-                        st.success(f"✅ Successfully received {success_count} items!")
-                    if error_count > 0:
-                        with col_result2:
-                            st.warning(f"⚠️ Failed to process {error_count} items")
-                    
+                st.dataframe(pd.DataFrame(mapped_preview), use_container_width=True)
+                if st.button("✅ Receive All Items from Excel", type="primary"):
+                    for item in mapped_preview:
+                        receive_inventory(item['sku'], item['quantity'], item['product'], item['location'])
+                    st.success("Excel records committed successfully!")
                     st.balloons()
-                    
             except Exception as e:
-                st.error(f"❌ Error processing Excel file: {e}")
-                logger.error(f"Excel processing error: {e}", exc_info=True)
+                st.error(f"Processing Error: {e}")
 
 # --- TAB 3: INVENTORY HUB ---
 with tabs[2]:
     st.markdown("### Master Stock List")
     current_inv = get_inventory()
     if not current_inv.empty:
-        edited_inv = st.data_editor(
-            current_inv, 
-            use_container_width=True, 
-            num_rows="dynamic",
-            column_config={"Stock": st.column_config.NumberColumn("Stock", min_value=0, step=1)}
-        )
+        edited_inv = st.data_editor(current_inv, use_container_width=True, num_rows="dynamic")
         if st.button("💾 Save Database Changes", type="primary"):
             bulk_update_inventory(edited_inv)
-            st.toast("✅ Master database updated successfully!")
+            st.toast("✅ Master database updated cleanly!", icon="✅")
             st.rerun()
-    else:
-        st.info("Inventory is empty. Please use the Inbound Receiving tab to add new stock.")
 
 # --- TAB 4: PICK & PACK ---
 with tabs[3]:
     orders_df = get_orders()
-    
-    if orders_df.empty:
-         st.info("No orders found in the database.")
-    else:
+    if not orders_df.empty:
         pending_df = orders_df[orders_df['Status'] == 'Pending']
-        
-        if pending_df.empty:
-            st.success("🎉 All caught up! No pending orders.")
-        else:
+        if not pending_df.empty:
             col_ord, col_scan = st.columns(2)
             with col_ord:
                 selected_order_id = st.selectbox("Select Order", pending_df['Order ID'].tolist())
                 current_order = pending_df[pending_df['Order ID'] == selected_order_id].iloc[0]
                 req_skus = [s.strip() for s in current_order['Required SKUs'].split(',')]
                 st.info(f"**Packing Order:** {selected_order_id}")
-                
-                inv_df = get_inventory()
-                for sku in req_skus:
-                    if not inv_df.empty and sku in inv_df['SKU'].values:
-                        prod_row = inv_df.loc[inv_df['SKU'] == sku, 'Product']
-                        p_label = prod_row.values[0]
-                    else:
-                        p_label = "Unknown SKU"
-                    st.markdown(f"- 📦 `{sku}` ({p_label})")
-
+                for sku in req_skus: st.markdown(f"- 📦 `{sku}`")
             with col_scan:
-                scanned_skus_input = st.text_area("Barcode Scanner Input", placeholder="Scan items here...", height=150)
-                if st.button("✅ Verify & Ship", type="primary", use_container_width=True):
+                scanned_skus_input = st.text_area("Barcode Scanner Input", placeholder="Scan items here...")
+                if st.button("✅ Verify & Ship", type="primary"):
                     scanned_list = [s.strip() for s in scanned_skus_input.split('\n') if s.strip()]
                     if sorted(scanned_list) == sorted(req_skus):
                         update_order_status(selected_order_id, 'Shipped')
-                        for sku in scanned_list:
-                            deduct_inventory(sku, 1)
-                        st.toast(f"Order {selected_order_id} verified and shipped!", icon="🚀")
-                        st.balloons()
+                        for sku in scanned_list: deduct_inventory(sku, 1)
+                        st.toast("Order shipped!", icon="🚀")
                         st.rerun()
                     else:
-                        st.error("❌ MISMATCH! Expected and scanned items do not align.")
+                        st.error("❌ MISMATCH! Items do not match the order list.")
 
 # --- TAB 5: RETURNS ---
 with tabs[4]:
-    ret_order = st.text_input("Original Order ID (Optional)")
+    ret_order = st.text_input("Original Order ID")
     ret_sku = st.text_input("Scan Returned SKU")
     ret_reason = st.selectbox("Return Reason", ["Customer Cancelled", "Defective/Damaged", "Wrong Item Shipped"])
     
     if st.button("🔄 Process Return", type="primary"):
         if ret_sku:
             if ret_reason == "Defective/Damaged":
-                st.toast(f"Logged {ret_sku} as damaged. Not added to active inventory.", icon="⚠️")
+                st.toast("Logged as Damaged. Excluded from clean warehouse stock.", icon="⚠️")
             else:
                 receive_inventory(ret_sku, 1)
-                st.toast(f"Restocked 1 unit of {ret_sku}.", icon="✅")
-            if ret_order:
-                update_order_status(ret_order, 'Returned')
-        else:
-            st.error("Please scan a returning SKU.")
+                st.toast("Restocked safely into live infrastructure.", icon="✅")
+            if ret_order: update_order_status(ret_order, 'Returned')
+            st.rerun()
 
 # --- TAB 6: PDF SEQUENCER ---
 with tabs[5]:
     st.title("📑 Document Collator & Alphabetical Pre-Sorter")
-    st.write("Upload a bulk compound document (shipping labels/manifests). The system will automatically scan each page, extract the product name, and pre-sort the document pages alphabetically.")
+    st.write("Upload a bulk compound document (shipping labels/manifests). The system will automatically scan each page, extract tracking keys, and pre-sort your document.")
     
     label_pdf = st.file_uploader("Upload Bulk Shipping Manifest File", type=["pdf"])
     
     st.divider()
-    st.markdown("### 🔗 **Custom Sort by Reference Tracking Numbers (Optional)**")
-    st.write("Paste a comma-separated or line-separated list of tracking numbers to sort the PDF pages in a specific order. Leave blank to sort alphabetically by product name.")
+    st.markdown("### 🔗 **Custom Sort by Reference Tracking Numbers**")
+    st.write("Paste your reference list from Excel or your system export. This field matches raw text containing 7-digit IDs alongside space-separated codes.")
+    
     reference_tracking = st.text_area(
-        "📌 Reference Tracking Numbers",
-        height=100,
-        placeholder="Enter tracking numbers (e.g., 1234-5678, 9999-0001, 8765-4321) or one per line"
+        "📌 Reference Tracking Numbers / Sheet Paste",
+        height=150,
+        placeholder="Example paste:\n5349213 1982\n5339536 6589"
     )
     
     if label_pdf:
-        if st.button("Analyze & Pre-Sort Pages"):
+        if st.button("Analyze & Pre-Sort Pages", type="primary"):
             try:
-                # Read PDF using pypdf
                 pdf_reader = pypdf.PdfReader(label_pdf)
                 num_pages = len(pdf_reader.pages)
                 
                 if num_pages == 0:
                     st.error("The uploaded PDF file contains no valid structural pages.")
                 else:
-                    st.info(f"Processing {num_pages} pages. Analyzing underlying text coordinate grids...")
+                    st.info(f"Processing {num_pages} pages. Analyzing text layers for 7-digit tracking sequences...")
                     
                     page_mappings = []
                     
+                    # 1. Parse out the target sequence order from user input text/image strings
+                    # Looks for any 7-digit sequences matching your standard layout structure
+                    reference_order = re.findall(r'\b\d{7}\b', reference_tracking)
+                    
                     for idx, page_obj in enumerate(pdf_reader.pages):
-                        page_text = page_obj.extract_text()
-                        
-                        # Fallback heuristic: look for common labels like "Product:", "Item:", or lines matching inventory SKU naming formats
-                        product_name = "UNKNOWN_PRODUCT"
-                        tracking_number = None
-                        
-                        # Clean up text lines for parsing
+                        page_text = page_obj.extract_text() or ""
                         lines = [line.strip() for line in page_text.split('\n') if line.strip()]
                         
-                        for line in lines:
-                            # Extract tracking number from page
-                            tn_match = SCANNING_ID_REGEX.search(line)
-                            if tn_match and not tracking_number:
-                                tracking_number = tn_match.group()
+                        product_name = "UNKNOWN_LOCATION"
+                        tracking_number = None
+                        secondary_id = ""
+                        
+                        # Find tracking numbers (7 digits) and text markers inside the PDF page
+                        all_page_numbers = re.findall(r'\b\d{4,7}\b', page_text)
+                        seven_digit_matches = [num for num in all_page_numbers if len(num) == 7]
+                        four_digit_matches = [num for num in all_page_numbers if len(num) == 4]
+                        
+                        if seven_digit_matches:
+                            tracking_number = seven_digit_matches[0]
+                        if four_digit_matches:
+                            secondary_id = four_digit_matches[0]
                             
-                            # Heuristic 1: Explicit metadata prefix identification
-                            if any(prefix in line.upper() for prefix in ["PRODUCT:", "ITEM NAME:", "DESCRIPTION:"]):
-                                product_name = re.sub(r'(?i)^(product|item name|description):\s*', '', line).strip()
-                                break
-                            # Heuristic 2: Match lines containing known stock variants (e.g., iPhone, Galaxy)
-                            elif any(keyword in line.upper() for keyword in ["IPHONE", "GALAXY", "SAMSUNG", "APPLE"]):
+                        for line in lines:
+                            if any(k in line.upper() for k in ["УЛИЦА", "ПОСЁЛОК", "Г ", "ОБЛ"]):
                                 product_name = line.strip()
                                 break
                         
-                        # If nothing matches, use the first non-empty line as a fallback placeholder
-                        if product_name == "UNKNOWN_PRODUCT" and lines:
-                            product_name = lines[0][:50]
-                            
                         page_mappings.append({
                             "page_index": idx,
-                            "product_name": product_name.upper(),
+                            "product_name": product_name,
                             "tracking_number": tracking_number,
+                            "secondary_id": secondary_id,
                             "page_object": page_obj
                         })
                     
-                    # Parse reference tracking numbers and create sort order
-                    reference_order = []
-                    if reference_tracking.strip():
-                        # Handle both comma-separated and line-separated formats
-                        if ',' in reference_tracking:
-                            reference_order = [tn.strip() for tn in reference_tracking.split(',') if tn.strip()]
-                        else:
-                            reference_order = [tn.strip() for tn in reference_tracking.split('\n') if tn.strip()]
-                    
-                    # Sort pages based on reference order or alphabetically
+                    # 2. Sequence Pages based on parsed spreadsheet references or fallback
                     if reference_order:
-                        # Create a priority mapping for reference tracking numbers
+                        # Priority dictionary mapping tracking IDs to their pasted row hierarchy
                         priority_map = {tn: idx for idx, tn in enumerate(reference_order)}
                         
                         sorted_mappings = sorted(
@@ -643,25 +509,27 @@ with tabs[5]:
                                 x["product_name"]
                             )
                         )
-                        st.success(f"✅ Sorted by {len(reference_order)} reference tracking numbers!")
+                        st.success(f"✅ Successfully sorted pages matching {len(reference_order)} custom reference indices!")
                     else:
-                        # Sort alphabetically by product name
+                        # Fallback to destination/product grouping rules
                         sorted_mappings = sorted(page_mappings, key=lambda x: x["product_name"])
-                        st.success("✅ Sorted alphabetically by product name!")
+                        st.success("✅ Sorted alphabetically by extracted address/product markers!")
                     
-                    # Log summary metrics matrix back to dashboard user
-                    st.subheader("📋 Sequenced Manifest Sort Mapping Matrix")
+                    # Render detailed execution logs
+                    st.subheader("📋 Sequenced Sorting Matrix")
                     summary_data = [
                         {
+                            "New Output Page": new_idx + 1,
                             "Original Page": m["page_index"] + 1, 
-                            "Identified Product Key": m["product_name"],
-                            "Tracking Number": m["tracking_number"] if m["tracking_number"] else "N/A"
+                            "Extracted Tracking Key": m["tracking_number"] if m["tracking_number"] else "Missing",
+                            "Secondary ID": m["secondary_id"],
+                            "Destination Heuristic": m["product_name"]
                         } 
-                        for m in sorted_mappings
+                        for new_idx, m in enumerate(sorted_mappings)
                     ]
                     st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
                     
-                    # Write out sorted structure to a fresh binary stream
+                    # Compile fresh binary binary architecture stream
                     pdf_writer = pypdf.PdfWriter()
                     for item in sorted_mappings:
                         pdf_writer.add_page(item["page_object"])
@@ -670,12 +538,12 @@ with tabs[5]:
                     pdf_writer.write(output_pdf_stream)
                     output_pdf_stream.seek(0)
                     
-                    st.success("🎉 Target document compiled safely! Ready for download.")
                     st.download_button(
-                        label="📥 Download Sorted Manifest (PDF)",
+                        label="📥 Download Sequenced PDF Manifest",
                         data=output_pdf_stream.getvalue(),
-                        file_name=f"Sorted_Manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                        mime="application/pdf"
+                        file_name=f"Sequenced_Manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
                     )
                     
             except Exception as e:
@@ -685,25 +553,52 @@ with tabs[5]:
 # --- TAB 7: AUDITOR ---
 with tabs[6]:
     st.subheader("⚖ Operational Discrepancy Auditor & Reconciliation Workbench")
-    st.markdown("Execute line checks across systems. Paste structural manifests to evaluate physical picking accuracy.")
+    st.markdown("Execute barcode reconciliations. This sheet strips spaces, auxiliary keys, and extracts explicit 7-digit system IDs automatically.")
     
     col_a, col_b = st.columns(2)
     with col_a: 
-        master_in = st.text_area("📋 Master Manifest Records (Expected System Data)", height=220, placeholder="Paste data containing tracking entries...")
+        master_in = st.text_area(
+            "📋 System Master Records / Excel Spreadsheet Paste", 
+            height=250, 
+            placeholder="Paste system data table columns here...\nExample:\n5349213 1982\n5339536 6589"
+        )
     with col_b: 
-        scan_in = st.text_area("📦 Physical Scanner Frame Output (Actual Inbound Ingest)", height=220, placeholder="Paste or scan barcodes sequentially...")
+        scan_in = st.text_area(
+            "📦 Actual Warehouse Scans / Manifest Ingest Data", 
+            height=250, 
+            placeholder="Paste raw tracking scans or full structural logs..."
+        )
         
-    audit_col1, audit_col2 = st.columns(2)
-    ignore_whitespace = audit_col1.checkbox("Normalize Variations & Clear Whitespace", value=True)
-    highlight_errors_only = audit_col2.checkbox("Filter Output to Display Errors Only", value=False)
-
     if st.button("⚡ Execute High-Volume Audit Validation Check", type="primary", use_container_width=True):
         if not master_in or not scan_in:
-            st.error("Data Deficit: Both operational telemetry zones require context vectors before checking data paths.")
+            st.error("Data Deficit: Please populate both operational data zones to evaluate structural differences.")
         else:
-            with st.spinner("Processing system diff tables..."):
-                m_map = robust_parse_multiline(master_in)
-                s_map = robust_parse_multiline(scan_in)
+            with st.spinner("Processing system cross-referencing logic matrices..."):
+                
+                # Enhanced extraction logic to handle multiple columns gracefully
+                def extract_structured_manifest_keys(raw_text):
+                    parsed_map = {}
+                    lines = raw_text.strip().split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        # Find any 7 digit tracking number keys on this row line entry
+                        found_keys = re.findall(r'\b\d{7}\b', line)
+                        if found_keys:
+                            target_key = found_keys[0]
+                            # Capture remaining numbers/words on that row line as associated tags
+                            remainder = line.replace(target_key, "").strip()
+                            parsed_map.setdefault(target_key, set())
+                            if remainder:
+                                parsed_map[target_key].add(remainder)
+                            else:
+                                parsed_map[target_key].add("Present")
+                    return parsed_map
+
+                m_map = extract_structured_manifest_keys(master_in)
+                s_map = extract_structured_manifest_keys(scan_in)
                 
                 all_tracking_ids = sorted(list(set(m_map.keys()) | set(s_map.keys())))
                 results_dataset = []
@@ -713,110 +608,61 @@ with tabs[6]:
                 perfect_matches = 0
                 
                 for tid in all_tracking_ids:
-                    exp_set = m_map.get(tid, set())
-                    got_set = s_map.get(tid, set())
+                    in_master = tid in m_map
+                    in_scans = tid in s_map
                     
-                    if ignore_whitespace:
-                        exp_set = {str(item).strip().upper() for item in exp_set}
-                        got_set = {str(item).strip().upper() for item in got_set}
+                    # Extract string variables for cleaner dashboard presentation
+                    master_meta = ", ".join(m_map.get(tid, [])) if in_master else ""
+                    scan_meta = ", ".join(s_map.get(tid, [])) if in_scans else ""
                     
-                    # Structural Logic Condition Matching
-                    if not exp_set and got_set:
-                        status_flag = "⚠️ SURPLUS OVERAGE"
-                        overages += 1
-                    elif exp_set and not got_set:
-                        status_flag = "❌ CRITICAL SHORTAGE"
-                        shortages += 1
-                    elif exp_set == got_set:
+                    if in_master and in_scans:
                         status_flag = "✅ STABLE MATCH"
                         perfect_matches += 1
-                    else:
-                        status_flag = "☣ METADATA MISMATCH"
+                    elif in_master and not in_scans:
+                        status_flag = "❌ CRITICAL SHORTAGE"
                         shortages += 1
+                    else:
+                        status_flag = "⚠️ SURPLUS OVERAGE"
+                        overages += 1
                 
-                    row_data = {
-                        "Tracking Reference ID": tid,
+                    results_dataset.append({
+                        "Tracking ID Key": tid,
                         "Status Class": status_flag,
-                        "Expected Elements": " | ".join(exp_set) if exp_set else "[EMPTY FIELD]",
-                        "Actual Elements": " | ".join(got_set) if got_set else "[UNREGISTERED SCAN]"
-                    }
-                    
-                    if highlight_errors_only and "MATCH" in status_flag:
-                        continue
-                    results_dataset.append(row_data)
+                        "Expected Metadata": master_meta if master_meta else "[NOT IN SYSTEM]",
+                        "Actual Scanned Metadata": scan_meta if scan_meta else "[MISSING FROM PHYSICAL]"
+                    })
                 
-                # Render Metrics Board
+                # Render Metrics Dashboard Summary Blocks
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Total Tracked Entities Checked", len(all_tracking_ids))
+                m1.metric("Total Unique IDs Audited", len(all_tracking_ids))
                 m2.metric("Perfect Matches", perfect_matches)
-                m3.metric("Shortages Found", shortages)
-                m4.metric("Overages Found", overages)
+                m3.metric("Shortages Found", shortages, delta="-", delta_color="inverse" if shortages > 0 else "normal")
+                m4.metric("Overages Found", overages, delta="+", delta_color="off" if overages > 0 else "normal")
                 
-                # Display results
+                # Display structural dataframe results
                 st.dataframe(pd.DataFrame(results_dataset), use_container_width=True)
 
 # --- TAB 8: BULK CONVERT & TEMPLATES ---
 with tabs[7]:
-    st.subheader("🔄 **Bulk Title Converter & Smart Templates**")
-    
-    with st.expander("📂 View & Manage Saved Templates (Dictionary)"):
-        template_df = get_templates()
-        if not template_df.empty:
-            edited_templates = st.data_editor(template_df, num_rows="dynamic", use_container_width=True)
-            if st.button("💾 Save Manual Template Edits"):
-                with sqlite3.connect(DB_PATH) as conn:
-                    edited_templates.to_sql('title_templates', conn, if_exists='replace', index=False)
-                st.toast("Templates updated!", icon="✅")
-                st.rerun()
-        else:
-            st.info("No templates saved yet. They will be generated automatically when you convert below.")
-
-    st.markdown("Paste data directly from Excel. It handles single columns (Titles) or double columns (Tracking ID + Title).")
-    col_w, col_g = st.columns(2)
-    with col_w: 
-        white_col = st.text_area("📄 Input (Excel Paste)", height=300, help="Paste Excel columns here (ID + Name, or just Name).")
-    
+    st.subheader("🔄 Bulk Title Converter")
+    white_col = st.text_area("📄 Input (Excel Paste Column Text data)")
     if st.button("✨ Convert, Map & Save Templates", type="primary"):
         if white_col:
-            with st.spinner("Processing templates and translating..."):
-                lines = white_col.strip().split('\n')
-                translator = GoogleTranslator(source='auto', target='en')
-                
-                template_df = get_templates()
-                template_dict = dict(zip(template_df['RawTitle'], template_df['StandardTitle'])) if not template_df.empty else {}
-                
-                results = []
-                new_saves = 0
-
-                for l in lines:
-                    parts = l.split('\t')
-                    if len(parts) >= 2:
-                        tracking_id, raw_title = parts[0].strip(), parts[1].strip()
-                        if raw_title in template_dict:
-                            std_title = template_dict[raw_title]
-                        else:
-                            translated = translator.translate(raw_title)
-                            std_title = standardize_title(translated) if translated else "UNKNOWN"
-                            upsert_template(raw_title, std_title)
-                            template_dict[raw_title] = std_title
-                            new_saves += 1
-                        results.append(f"{tracking_id}\t{std_title}")
-                    elif len(parts) == 1 and parts[0].strip():
-                        raw_title = parts[0].strip()
-                        if raw_title in template_dict:
-                            std_title = template_dict[raw_title]
-                        else:
-                            translated = translator.translate(raw_title)
-                            std_title = standardize_title(translated) if translated else "UNKNOWN"
-                            upsert_template(raw_title, std_title)
-                            template_dict[raw_title] = std_title
-                            new_saves += 1
-                        results.append(std_title)
-
-                if new_saves > 0:
-                    st.toast(f"Saved {new_saves} new items to the Template Database!", icon="💾")
+            lines = white_col.strip().split('\n')
+            translator = GoogleTranslator(source='auto', target='en')
+            template_df = get_templates()
+            template_dict = dict(zip(template_df['RawTitle'], template_df['StandardTitle'])) if not template_df.empty else {}
+            
+            converted_outputs = []
+            for line in lines:
+                parts = line.split('\t')
+                raw_title = parts[1].strip() if len(parts) >= 2 else parts[0].strip()
+                if raw_title in template_dict:
+                    std_title = template_dict[raw_title]
                 else:
-                    st.toast("100% Match from existing templates. Zero translations used!", icon="⚡")
-
-                with col_g: 
-                    st.text_area("✅ Output (Standardized)", value="\n".join(results), height=300)
+                    translated = translator.translate(raw_title)
+                    std_title = standardize_title(translated)
+                    upsert_template(raw_title, std_title)
+                    template_dict[raw_title] = std_title
+                converted_outputs.append(std_title)
+            st.text_area("✅ Output (Standardized)", value="\n".join(converted_outputs), height=200)
