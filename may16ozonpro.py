@@ -175,24 +175,17 @@ def generate_user_guide():
         pdf.multi_cell(0, 6, desc)
         pdf.ln(4)
         
-    # Standard string output cast as bytes buffer object
-    return pdf.output(dest='S').encode('latin1')
-
-def robust_parse_multiline(text_data):
-    data_map = {}
-    current_tn = None
-    for line in text_data.strip().split('\n'):
-        line = line.strip()
-        if not line: continue
-        tn_match = SCANNING_ID_REGEX.search(line)
-        if tn_match:
-            current_tn = tn_match.group()
-            desc = line.replace(current_tn, "").strip('|').strip()
-            data_map.setdefault(current_tn, set())
-            if desc: data_map[current_tn].add(desc)
-        elif current_tn:
-            data_map[current_tn].add(line)
-    return data_map
+    # Robust multi-version output extraction
+    try:
+        # Works for standard fpdf2 (returns bytes/bytearray directly)
+        raw_output = pdf.output()
+        if isinstance(raw_output, (bytes, bytearray)):
+            return bytes(raw_output)
+        # Fallback for legacy fpdf (returns a string requiring encoding)
+        return str(raw_output).encode('latin1')
+    except TypeError:
+        # Alternative fallback if dest matching is strictly enforced by the local environment
+        return pdf.output(dest='S').encode('latin1')
 
 def standardize_title(raw_text):
     if not raw_text: return "UNKNOWN"
